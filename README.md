@@ -3,3 +3,7 @@
 ```powershell
 Get-NetAdapterBinding -AllBindings -ComponentID ZS_ZAPPRD
 ```
+## disable network adapter binding
+```
+Get-NetAdapterBinding -AllBindings -ComponentID ZS_ZAPPRD | Disable-NetAdapterBinding
+```
