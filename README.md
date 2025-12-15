@@ -7,3 +7,7 @@ Get-NetAdapterBinding -AllBindings -ComponentID ZS_ZAPPRD
 ```
 Get-NetAdapterBinding -AllBindings -ComponentID ZS_ZAPPRD | Disable-NetAdapterBinding
 ```
+## enable network adapter binding
+```
+Get-NetAdapterBinding -AllBindings -ComponentID ZS_ZAPPRD | Enable-NetAdapterBinding
+```
