@@ -2,11 +2,14 @@
 #
 # setup.sh - Install the Zscaler root CA certificate into a JDK's trust
 #            store (cacerts), npm's cafile config, pip's cert config, the
-#            Linux/WSL OS trust store, and MSYS2's own CA trust store (the
-#            one pacman/curl/git use inside MINGW64/MINGW32/UCRT64), so
-#            Java, npm, pip, apt, pacman, curl, wget and git all work behind
-#            the Zscaler TLS-inspecting proxy. Works on native Windows (Git
-#            Bash/MSYS, MSYS2/MinGW64), WSL Ubuntu/Debian, Linux and macOS.
+#            Linux/WSL OS trust store, MSYS2's own CA trust store (the one
+#            pacman/curl/git use inside MINGW64/MINGW32/UCRT64), and the
+#            trust store INSIDE a Docker-hosting WSL2 distro (Rancher
+#            Desktop / Docker Desktop) so `docker pull`/`docker build` work
+#            too, so Java, npm, pip, apt, pacman, curl, wget, git and docker
+#            all work behind the Zscaler TLS-inspecting proxy. Works on
+#            native Windows (Git Bash/MSYS, MSYS2/MinGW64), WSL Ubuntu/
+#            Debian, Linux and macOS.
 #
 # Usage:
 #   ./setup.sh [options]
@@ -31,6 +34,10 @@
 #   -S, --skip-system-ca      Skip installing into the OS trust store (apt/curl/wget/git)
 #   -M, --skip-msys-ca        Skip installing into MSYS2's own CA store (pacman/curl/git
 #                             inside MINGW64/MINGW32/UCRT64/MSYS)
+#   -D, --skip-docker-ca      Skip installing into the Docker-hosting WSL2 distro's CA
+#                             store (Rancher Desktop / Docker Desktop)
+#   -T, --docker-distro <name> WSL distro name to target for -D (default: auto-detect
+#                             "rancher-desktop" then "docker-desktop")
 #   -r, --remove             Remove the alias instead of installing it
 #   -l, --list                List whether the alias is currently installed
 #   -h, --help                Show this help
@@ -78,6 +85,28 @@
 #   running under MSYS2/MinGW, or if MSYS2's ca-certificates package isn't
 #   installed (`pacman -S ca-certificates`).
 #
+# Docker (Rancher Desktop / Docker Desktop) support:
+#   This is what fixes `docker pull`/`docker build`/`docker login` failing
+#   with certificate errors, when the Docker CLI/daemon actually run inside
+#   a WSL2 distro (as Rancher Desktop and Docker Desktop's WSL2 backend do)
+#   rather than natively on Windows. The script shells out to `wsl.exe -d
+#   <distro> --user root` to copy the cert into that distro's own
+#   /usr/local/share/ca-certificates/<alias>.crt and run
+#   `update-ca-certificates` there -- this is the same Debian/Ubuntu
+#   mechanism as the System CA section above, just applied inside a
+#   different, nested Linux environment. The target distro is
+#   auto-detected from `wsl.exe -l -v` (prefers an installed
+#   "rancher-desktop" distro, falling back to "docker-desktop"; never
+#   matches the paired "-data" volume distros) or set explicitly with
+#   -T/--docker-distro. --remove deletes that file and refreshes the store
+#   (note: Rancher Desktop also auto-syncs the Windows Root CA store into
+#   this same distro on every VM boot, so the Zscaler cert may reappear on
+#   its own even after --remove -- that's Rancher Desktop's own behavior,
+#   independent of this script). --list shows whether it's currently
+#   installed. Skip with -D. No-op (with a log message) on Linux/macOS, or
+#   if `wsl.exe` isn't found, or no matching distro is running, or the
+#   distro has no `update-ca-certificates`.
+#
 # npm support:
 #   The cert is converted to PEM and copied to
 #   ~/.zscaler-certs/zscaler-root-ca.pem, then `npm config set cafile`
@@ -121,6 +150,8 @@ SKIP_NPM=""
 SKIP_PIP=""
 SKIP_SYSTEM_CA=""
 SKIP_MSYS_CA=""
+SKIP_DOCKER_CA=""
+DOCKER_DISTRO_OVERRIDE=""
 PERSIST_DIR="${HOME:-/tmp}/.zscaler-certs"
 PERSIST_PEM="$PERSIST_DIR/zscaler-root-ca.pem"
 
@@ -129,7 +160,7 @@ err()  { printf '[setup] ERROR: %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
 usage() {
-  sed -n '2,105p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,134p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -143,6 +174,8 @@ while [ $# -gt 0 ]; do
     -P|--skip-pip)   SKIP_PIP="1"; shift ;;
     -S|--skip-system-ca) SKIP_SYSTEM_CA="1"; shift ;;
     -M|--skip-msys-ca) SKIP_MSYS_CA="1"; shift ;;
+    -D|--skip-docker-ca) SKIP_DOCKER_CA="1"; shift ;;
+    -T|--docker-distro) DOCKER_DISTRO_OVERRIDE="$2"; shift 2 ;;
     -r|--remove)     ACTION="remove"; shift ;;
     -l|--list)       ACTION="list"; shift ;;
     -h|--help)       usage; exit 0 ;;
@@ -438,6 +471,48 @@ if [ -n "$IS_MSYS" ]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# Detect a Docker-hosting WSL2 distro (Rancher Desktop / Docker Desktop) so
+# the Zscaler cert can be installed INSIDE it -- this is what fixes
+# `docker pull`/`docker build`/`docker login` when the Docker CLI/daemon
+# actually run inside their own WSL2 distro rather than natively on
+# Windows. Only makes sense from a native-Windows host with `wsl.exe`
+# available (gated on NOT already being inside WSL, to avoid nested-WSL
+# weirdness). Auto-detects "rancher-desktop" first, then "docker-desktop",
+# explicitly skipping their paired "*-data" volume-only distros; override
+# with -T/--docker-distro.
+# ---------------------------------------------------------------------------
+WSL_BIN=""
+[ -z "$IS_WSL" ] && command -v wsl.exe >/dev/null 2>&1 && WSL_BIN="wsl.exe"
+
+DOCKER_DISTRO=""
+if [ -n "$WSL_BIN" ]; then
+  if [ -n "$DOCKER_DISTRO_OVERRIDE" ]; then
+    DOCKER_DISTRO="$DOCKER_DISTRO_OVERRIDE"
+  else
+    wsl_distros="$("$WSL_BIN" -l -v 2>/dev/null | tr -d '\0\r' | tail -n +2 | sed 's/^\* //' | awk '{print $1}')"
+    for candidate in rancher-desktop docker-desktop; do
+      if printf '%s\n' "$wsl_distros" | grep -qx "$candidate"; then
+        DOCKER_DISTRO="$candidate"
+        break
+      fi
+    done
+  fi
+fi
+
+HAVE_DOCKER_CA=""
+DOCKER_CA_FILE="/usr/local/share/ca-certificates/${ALIAS}.crt"
+if [ -n "$DOCKER_DISTRO" ]; then
+  if "$WSL_BIN" -d "$DOCKER_DISTRO" --user root -- sh -c 'command -v update-ca-certificates' >/dev/null 2>&1; then
+    HAVE_DOCKER_CA="1"
+    log "Using Docker WSL distro '$DOCKER_DISTRO' CA store: $DOCKER_CA_FILE"
+  else
+    log "WSL distro '$DOCKER_DISTRO' found but has no update-ca-certificates; skipping Docker trust setup"
+  fi
+elif [ -n "$WSL_BIN" ]; then
+  log "No rancher-desktop/docker-desktop WSL distro found (pass -T/--docker-distro to target one); skipping Docker trust setup"
+fi
+
 run_system_ca_write() {
   if [ -n "$AM_ROOT" ]; then
     "$@"
@@ -559,12 +634,42 @@ msys_ca_list() {
   done
 }
 
+docker_ca_configure() {
+  pem_path="$1"
+  [ -n "$HAVE_DOCKER_CA" ] || { log "Docker WSL distro CA store not available, skipping docker config"; return 0; }
+  "$WSL_BIN" -d "$DOCKER_DISTRO" --user root -- sh -c "cat > '$DOCKER_CA_FILE' && update-ca-certificates" < "$pem_path" >/dev/null
+  log "Installed into Docker WSL distro '$DOCKER_DISTRO' CA store -> $DOCKER_CA_FILE (docker pull/build/login now trust it)"
+}
+
+docker_ca_unconfigure() {
+  [ -n "$HAVE_DOCKER_CA" ] || { log "Docker WSL distro CA store not available, skipping docker cleanup"; return 0; }
+  if "$WSL_BIN" -d "$DOCKER_DISTRO" --user root -- sh -c "test -f '$DOCKER_CA_FILE'" >/dev/null 2>&1; then
+    "$WSL_BIN" -d "$DOCKER_DISTRO" --user root -- sh -c "rm -f '$DOCKER_CA_FILE' && update-ca-certificates" >/dev/null
+    log "Removed from Docker WSL distro '$DOCKER_DISTRO' CA store: $DOCKER_CA_FILE"
+  else
+    log "$DOCKER_CA_FILE not present in '$DOCKER_DISTRO', nothing to remove"
+  fi
+}
+
+docker_ca_list() {
+  if [ -z "$DOCKER_DISTRO" ]; then
+    log "No Docker WSL distro detected (no docker trust to check)"
+    return 0
+  fi
+  if "$WSL_BIN" -d "$DOCKER_DISTRO" --user root -- sh -c "test -f '$DOCKER_CA_FILE'" >/dev/null 2>&1; then
+    log "Docker WSL distro '$DOCKER_DISTRO' CA store: $DOCKER_CA_FILE IS installed"
+  else
+    log "Docker WSL distro '$DOCKER_DISTRO' CA store: $DOCKER_CA_FILE is NOT installed"
+  fi
+}
+
 if [ -z "$HAVE_JDK" ] \
    && { [ -n "$SKIP_NPM" ] || [ -z "$HAVE_NPM" ]; } \
    && { [ -n "$SKIP_PIP" ] || [ -z "$HAVE_PIP" ]; } \
    && { [ -n "$SKIP_SYSTEM_CA" ] || [ -z "$HAVE_SYSTEM_CA" ]; } \
-   && { [ -n "$SKIP_MSYS_CA" ] || [ -z "$HAVE_MSYS_CA" ]; }; then
-  die "Nothing to do: no JDK, npm, pip or system CA store found (or all skipped). Install one of them, or pass -j/--java-home."
+   && { [ -n "$SKIP_MSYS_CA" ] || [ -z "$HAVE_MSYS_CA" ]; } \
+   && { [ -n "$SKIP_DOCKER_CA" ] || [ -z "$HAVE_DOCKER_CA" ]; }; then
+  die "Nothing to do: no JDK, npm, pip, system CA, MSYS2 CA or Docker WSL distro found (or all skipped). Install one of them, or pass -j/--java-home."
 fi
 
 # ---------------------------------------------------------------------------
@@ -678,6 +783,7 @@ if [ "$ACTION" = "list" ]; then
   [ -n "$SKIP_PIP" ] || pip_list
   [ -n "$SKIP_SYSTEM_CA" ] || system_ca_list
   [ -n "$SKIP_MSYS_CA" ] || msys_ca_list
+  [ -n "$SKIP_DOCKER_CA" ] || docker_ca_list
   exit 0
 fi
 
@@ -696,6 +802,7 @@ if [ "$ACTION" = "remove" ]; then
   [ -n "$SKIP_PIP" ] || pip_unconfigure
   [ -n "$SKIP_SYSTEM_CA" ] || system_ca_unconfigure
   [ -n "$SKIP_MSYS_CA" ] || msys_ca_unconfigure
+  [ -n "$SKIP_DOCKER_CA" ] || docker_ca_unconfigure
   rm -f "$PERSIST_PEM"
   exit 0
 fi
@@ -802,13 +909,14 @@ fi
 # ---------------------------------------------------------------------------
 # Configure npm / pip / system CA store / MSYS2 CA store (best-effort)
 # ---------------------------------------------------------------------------
-if [ -z "$SKIP_NPM" ] || [ -z "$SKIP_PIP" ] || [ -z "$SKIP_SYSTEM_CA" ] || [ -z "$SKIP_MSYS_CA" ]; then
+if [ -z "$SKIP_NPM" ] || [ -z "$SKIP_PIP" ] || [ -z "$SKIP_SYSTEM_CA" ] || [ -z "$SKIP_MSYS_CA" ] || [ -z "$SKIP_DOCKER_CA" ]; then
   SHARED_PEM="$TMP_DIR/zscaler-shared.pem"
   if ensure_pem "$CERT_FILE" "$SHARED_PEM"; then
     [ -n "$SKIP_NPM" ] || npm_configure "$SHARED_PEM"
     [ -n "$SKIP_PIP" ] || pip_configure "$SHARED_PEM"
     [ -n "$SKIP_SYSTEM_CA" ] || system_ca_configure "$SHARED_PEM"
     [ -n "$SKIP_MSYS_CA" ] || msys_ca_configure "$SHARED_PEM"
+    [ -n "$SKIP_DOCKER_CA" ] || docker_ca_configure "$SHARED_PEM"
   else
     err "Could not convert $CERT_FILE to PEM; skipping npm/pip/system-CA config"
   fi
